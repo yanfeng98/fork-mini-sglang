@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from minisgl.core import Batch, Req
 from minisgl.env import ENV
 from minisgl.message import (
+    AbortBackendMsg,
     BaseBackendMsg,
     BatchBackendMsg,
     DetokenizeMsg,
@@ -104,12 +105,7 @@ class Scheduler(SchedulerIOMixin):
         # free resources for finished but not ongoing reqs
         ongoing_reqs = ongoing_data[0].batch.reqs if ongoing_data else []
         for req in self.finished_reqs.difference(ongoing_reqs):
-            self.table_manager.free(req.table_idx)
-            self.cache_manager.free_and_cache_finished_req(
-                req.cache_handle,
-                req.input_ids[: req.cached_len],
-                self.page_table[req.table_idx, : req.cached_len],
-            )
+            self._free_req_resources(req)
 
         # keep only ongoing reqs in the finished set
         self.finished_reqs.intersection_update(ongoing_reqs)
@@ -136,9 +132,34 @@ class Scheduler(SchedulerIOMixin):
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
             self.prefill_manager.add_one_req(msg)
+        elif isinstance(msg, AbortBackendMsg):
+            self.abort_req(msg.uid)
         else:
             logger.error(f"Unknown message type: {type(msg)}")
             raise NotImplementedError
+
+    def _free_req_resources(self, req: Req) -> None:
+        self.table_manager.free(req.table_idx)
+        self.cache_manager.free_and_cache_finished_req(
+            req.cache_handle,
+            req.input_ids[: req.cached_len],
+            self.page_table[req.table_idx, : req.cached_len],
+        )
+
+    def abort_req(self, uid: int) -> None:
+        logger.info_rank0(f"Aborting request {uid}")
+
+        # try to abort from prefill first
+        # if the request is in the pending list or being prefilled, remove it and free resources
+        if req_to_free := self.prefill_manager.abort_req(uid):
+            self._free_req_resources(req_to_free)
+            return
+
+        # try to abort from decode
+        if req_to_free := self.decode_manager.abort_req(uid):
+            self.finished_reqs.discard(req_to_free)
+            self._free_req_resources(req_to_free)
+            return
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         needed_size = sum(r.extend_len for r in batch.reqs)

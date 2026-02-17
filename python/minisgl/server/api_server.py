@@ -9,11 +9,12 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Literal, Tuple
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 from minisgl.core import SamplingParams
 from minisgl.env import ENV
 from minisgl.message import (
+    AbortMsg,
     BaseFrontendMsg,
     BaseTokenizerMsg,
     BatchFrontendMsg,
@@ -117,7 +118,8 @@ class FrontendManager:
         while True:
             msg = await self.recv_tokenizer.get()
             for msg in _unwrap_msg(msg):
-                assert msg.uid in self.ack_map
+                if msg.uid not in self.ack_map:
+                    continue
                 self.ack_map[msg.uid].append(msg)
                 self.event_map[msg.uid].set()
 
@@ -186,6 +188,20 @@ class FrontendManager:
         yield b"data: [DONE]\n\n"
         logger.debug("Finished streaming response for user %s", uid)
 
+    async def stream_with_cancellation(self, generator, request: Request, uid: int):
+        try:
+            async for chunk in generator:
+                # detect if the client has disconnected
+                if await request.is_disconnected():
+                    logger.info("Client disconnected for user %s", uid)
+                    raise asyncio.CancelledError
+                yield chunk
+        except asyncio.CancelledError:
+            logger.info("Request cancelled for user %s", uid)
+            raise
+        finally:
+            asyncio.create_task(self.abort_user(uid))
+
     async def abort_user(self, uid: int):
         await asyncio.sleep(0.1)
         if uid in self.ack_map:
@@ -193,6 +209,7 @@ class FrontendManager:
         if uid in self.event_map:
             del self.event_map[uid]
         logger.warning("Aborting request for user %s", uid)
+        await self.send_one(AbortMsg(uid=uid))
 
     def shutdown(self):
         self.send_tokenizer.stop()
@@ -212,7 +229,7 @@ app = FastAPI(title="MiniSGL API Server", version="0.0.1", lifespan=lifespan)
 
 
 @app.post("/generate")
-async def generate(req: GenerateRequest):
+async def generate(req: GenerateRequest, request: Request):
     logger.debug("Received generate request %s", req)
     state = get_global_state()
     uid = state.new_user()
@@ -227,13 +244,9 @@ async def generate(req: GenerateRequest):
         )
     )
 
-    async def _abort():
-        await state.abort_user(uid)
-
     return StreamingResponse(
-        state.stream_generate(uid),
+        state.stream_with_cancellation(state.stream_generate(uid), request, uid),
         media_type="text/event-stream",
-        background=BackgroundTask(lambda: _abort),
     )
 
 
@@ -243,7 +256,7 @@ async def v1_root():
 
 
 @app.post("/v1/chat/completions")
-async def v1_completions(req: OpenAICompletionRequest):
+async def v1_completions(req: OpenAICompletionRequest, request: Request):
     state = get_global_state()
     if req.messages:
         prompt = [msg.model_dump() for msg in req.messages]
@@ -267,13 +280,9 @@ async def v1_completions(req: OpenAICompletionRequest):
         )
     )
 
-    async def _abort():
-        await state.abort_user(uid)
-
     return StreamingResponse(
-        state.stream_chat_completions(uid),
+        state.stream_with_cancellation(state.stream_chat_completions(uid), request, uid),
         media_type="text/event-stream",
-        background=BackgroundTask(lambda: _abort),
     )
 
 
